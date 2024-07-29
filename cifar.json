@@ -1,0 +1,5 @@
+{
+    "name": "cifar",
+    "dataset": "CIFAR10",
+    "dataset_directory": "../IIB_project/recombiner_bones/trainset/"
+}
