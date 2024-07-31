@@ -148,6 +148,9 @@ class Trainer(nn.Module):
         transform=None,
     ):
         super().__init__()
+        
+        self.transform = transform
+        
         representations = nn.ModuleList([
             ImageINR(
                 dim_in=dim_in,
@@ -238,8 +241,10 @@ class Trainer(nn.Module):
         epochs,
         transform_training=False,
     ):
-        
-        self.opt = Adam([*self.params.values(), *self.transform.get_train_params(transform_training)], lr=lr)
+        if self.transform is not None:
+            self.opt = Adam([*self.params.values(), *self.transform.get_train_params(transform_training)], lr=lr)
+        else:
+            self.opt = Adam(self.params.values(), lr=lr)
         self.sched = lr_scheduler.MultiStepLR(self.opt, milestones=[int(epochs * 0.8)], gamma=0.5)
         
     def calculate_pnsr(self, X, Y, args, testing=True):
