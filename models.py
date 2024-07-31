@@ -10,6 +10,31 @@ import numpy as np
 import copy
 
 
+class LinearMapping(nn.Module):
+    def __init__(self, args, dims, scale_in=1, scale_out=1, bias=False):
+        super().__init__()
+        self.A = nn.ParameterList([nn.Linear(int(dims[i] * (dims[i-1]+1) * scale_in), int(dims[i] * (dims[i-1]+1) * scale_out), device=args.device, bias=bias) for i in range(1, len(dims))])
+        with torch.no_grad():
+            for i, param in enumerate(self.A):
+                a = -1 / (dims[i+1] * (dims[i]+1))
+                nn.init.uniform_(param.weight, a, -a)  # Give it a head start - similar to RECOMBINER
+                if param.bias is not None:
+                    nn.init.zeros_(param.bias)
+                    pass
+        
+    def forward(self, x, layer_id, testing):
+        if testing:
+            if self.A[layer_id].bias is not None:
+                return x @ self.A[layer_id].weight.T.clone().detach() + self.A[layer_id].bias.clone().detach()
+            return x @ self.A[layer_id].weight.T.clone().detach()
+        return self.A[layer_id](x)
+    
+    def get_train_params(self, transform_training):
+        if transform_training:
+            return self.params()
+        return []
+
+
 class VariationalSirenLayer(nn.Module):
     def __init__(
         self,
@@ -20,6 +45,7 @@ class VariationalSirenLayer(nn.Module):
         w0=30,
         c=6,
         activation=None,
+        transform=None
     ):
         super().__init__()
         self.dim_in = dim_in
@@ -33,6 +59,12 @@ class VariationalSirenLayer(nn.Module):
             self.activation_function = lambda x: torch.sin(x * self.w0)
         else:
             self.activation_function = activation
+            
+        if transform is None:
+            self.transform = torch.nn.Identity()
+        else:
+            self.transform = transform
+            
         self.st = lambda x: F.softplus(x, beta=1, threshold=20)
         
         
@@ -41,6 +73,8 @@ class VariationalSirenLayer(nn.Module):
         x,
     ):
         latent_sample = self.mu + self.st(self.log_std) * torch.randn_like(self.log_std)
+        
+        latent_sample = self.transform(latent_sample)
 
         w, b = latent_sample[:-1], latent_sample[-1]
 
@@ -66,6 +100,7 @@ class ImageINR(nn.Module):
         std_init,
         w0=30,
         c=6,
+        transform=None,
     ):
         super().__init__()
         self.dim_in = dim_in
@@ -82,7 +117,8 @@ class ImageINR(nn.Module):
                 mu_magnitude = w_std,
                 w0 = w0,
                 c = c,
-                activation= torch.nn.Identity() if i == num_layers - 1 else None
+                activation= torch.nn.Identity() if i == num_layers - 1 else None,
+                transform=transform,
             ))
             
         self.layers = nn.Sequential(*layers)
@@ -109,6 +145,7 @@ class Trainer(nn.Module):
         std_init,
         w0=30,
         c=6,
+        transform=None,
     ):
         super().__init__()
         representations = nn.ModuleList([
@@ -121,6 +158,7 @@ class Trainer(nn.Module):
                 std_init=std_init,
                 w0=w0,
                 c=c,
+                transform=transform,
             ).to("cuda") for _ in range(size)  # complains if .to is removed :shrug:
         ])
         self.params, self.buffers = stack_module_state(representations)
@@ -171,8 +209,9 @@ class Trainer(nn.Module):
         epochs,
         lr,
         kl_beta,
+        transform_training=False,
     ):
-        self.init_opt(lr, epochs=epochs)
+        self.init_opt(lr, epochs=epochs, transform_training=transform_training)
         
         for epoch in range(epochs):
             self.opt.zero_grad()
@@ -197,10 +236,10 @@ class Trainer(nn.Module):
         self,
         lr,
         epochs,
-        train_prior=True,
+        transform_training=False,
     ):
         
-        self.opt = Adam(self.params.values(), lr=lr)
+        self.opt = Adam([*self.params.values(), *self.transform.get_train_params(transform_training)], lr=lr)
         self.sched = lr_scheduler.MultiStepLR(self.opt, milestones=[int(epochs * 0.8)], gamma=0.5)
         
     def calculate_pnsr(self, X, Y, args, testing=True):
