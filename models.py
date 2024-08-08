@@ -24,18 +24,18 @@ class VariationalSirenLayer(nn.Module):
         super().__init__()
         self.dim_in = dim_in
         self.dim_out = dim_out
-        
+
         self.mu = nn.Parameter(torch.FloatTensor(dim_in + 1, dim_out).uniform_(-mu_magnitude, mu_magnitude))
         self.log_std = nn.Parameter(torch.FloatTensor(dim_in + 1, dim_out).fill_(std_init))
-        
+
         self.w0 = w0
         if activation is None:
             self.activation_function = lambda x: torch.sin(x * self.w0)
         else:
             self.activation_function = activation
         self.st = lambda x: F.softplus(x, beta=1, threshold=20)
-        
-        
+
+
     def forward(
         self,
         x,
@@ -45,16 +45,16 @@ class VariationalSirenLayer(nn.Module):
         w, b = latent_sample[:-1], latent_sample[-1]
 
         return self.activation_function(x @ w + b)
-    
+
     @property
     def std(self):
         return torch.exp(self.log_std)
-    
+
     @std.setter
     def std(self, value):
         self.log_std.copy_(torch.log(value))
-    
-    
+
+
 class ImageINR(nn.Module):
     def __init__(
         self,
@@ -70,7 +70,7 @@ class ImageINR(nn.Module):
         super().__init__()
         self.dim_in = dim_in
         self.dim_fourier = dim_fourier
-        
+
         layers = []
         for i in range(num_layers):
             w_std = (1 / dim_fourier) if i == 0 else (np.sqrt(c / dim_hidden) / w0)
@@ -84,9 +84,9 @@ class ImageINR(nn.Module):
                 c = c,
                 activation= torch.nn.Identity() if i == num_layers - 1 else None
             ))
-            
+
         self.layers = nn.Sequential(*layers)
-        
+
     def forward(
         self,
         x,
@@ -95,8 +95,8 @@ class ImageINR(nn.Module):
         for layer in self.layers:
             y = layer(y)
         return self.layers(x)
-            
-            
+
+
 class Trainer(nn.Module):
     def __init__(
         self,
@@ -124,7 +124,7 @@ class Trainer(nn.Module):
             ).to("cuda") for _ in range(size)  # complains if .to is removed :shrug:
         ])
         self.params, self.buffers = stack_module_state(representations)
-        
+
         self.prior = ImageINR(
             dim_in=dim_in,
             dim_fourier=dim_fourier,
@@ -137,24 +137,24 @@ class Trainer(nn.Module):
         )
         for i, layer in enumerate(self.prior.layers):
             w_std = (1 / dim_fourier) if i == 0 else (np.sqrt(c / dim_hidden) / w0)
-            
+
             nn.init.constant_(layer.mu, 0)
             nn.init.constant_(layer.log_std, w_std * 0.5)  # init_std_scale param from COMBINER
-            
+
         self.st = lambda x: F.softplus(x, beta=1, threshold=20)
         self.mse = torch.nn.MSELoss()
         self.base_model = [copy.deepcopy(self.prior).to("meta")]
         self.size = size
-        
-        
+
+
     def forward(
         self,
         X,
     ):
         X = torch.vmap(self.convert_posenc)(X)
         return torch.vmap(self.fmodel, randomness="different")(self.params, self.buffers, X)
-        
-        
+
+
     def convert_posenc(self, x):
         if x.dim() == 0:
             return torch.stack((x,)*32)
@@ -163,7 +163,7 @@ class Trainer(nn.Module):
         x = torch.matmul(x.unsqueeze(-1), w.unsqueeze(0)).view(*x.shape[:-1], -1)
         x = torch.cat([torch.cos(np.pi * x), torch.sin(np.pi * x)], dim=-1)
         return x
-    
+
     def train(
         self,
         X,
@@ -173,49 +173,44 @@ class Trainer(nn.Module):
         kl_beta,
     ):
         self.init_opt(lr, epochs=epochs)
-        
+
         for epoch in range(epochs):
             self.opt.zero_grad()
 
             Y_hat = self(X)
-            
+
             mse = self.mse(Y_hat, Y)
-            
+
             kld = self.kld()
-            
+
             loss = mse + kld * kl_beta
-            
+
             loss.backward()
             self.opt.step()
             self.sched.step()
-            
+
     def fmodel(self, params, buffers, x):
         return functional_call(self.base_model[0], (params, buffers), (x,))  # (x,)
-            
-            
+
+
     def init_opt(
         self,
         lr,
         epochs,
         train_prior=True,
     ):
-        
+
         self.opt = Adam(self.params.values(), lr=lr)
         self.sched = lr_scheduler.MultiStepLR(self.opt, milestones=[int(epochs * 0.8)], gamma=0.5)
-        
-    def calculate_pnsr(self, X, Y, args, testing=True):
-        Y_hat = self(X)
-        Y_hat = torch.clamp(Y_hat, 0., 1.)
-        Y_hat = torch.round(Y_hat * 255) / 255
-        return 20. * np.log10(1.) - 10. * (Y_hat - Y).detach().pow(2).mean().log10().cpu().item()
-    
+
+
     def kld(self):
         prior_params = dict(self.prior.named_parameters())
         return sum([kl_divergence(
                 Normal(self.params[f"layers.{i}.mu"], self.st(self.params[f"layers.{i}.log_std"])),
                 Normal(prior_params[f"layers.{i}.mu"], prior_params[f"layers.{i}.log_std"])
             ).sum() for i in range(len(self.prior.layers))]) / self.size
-            
+
     def update_prior(self):
         with torch.no_grad():
             prior_params = dict(self.prior.named_parameters())
@@ -225,12 +220,12 @@ class Trainer(nn.Module):
                     self.params[f"layers.{i}.mu"].clone().detach().var(0) + \
                     self.st(self.params[f"layers.{i}.log_std"].clone().detach()).pow(2).mean(0)
                 ))
-            
+
     def calculate_pnsr(self, X, Y):
         Y_hat = self(X)
         Y_hat = torch.clamp(Y_hat, 0., 1.)
         Y_hat = torch.round(Y_hat * 255) / 255
         return 20. * np.log10(1.) - 10. * (Y_hat - Y).detach().pow(2).mean().log10().cpu().item()
-    
+
     def calculate_bpp(self, X, Y):
         return self.kld() / X.shape[1] / np.log(2)

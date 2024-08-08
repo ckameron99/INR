@@ -20,8 +20,8 @@ class SimpleMLP(nn.Module):
         x = F.relu(x)
         x = self.fc3(x)
         return x
-    
-    
+
+
 device = 'cuda'
 num_models = 10
 
