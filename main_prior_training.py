@@ -75,9 +75,11 @@ def main():
 
 
     compression_model.prior.load_state_dict(prior_model.prior.state_dict())
-    compression_model.train(X_testing, Y_testing, 30_000, lr, kl_beta)
+    compression_model.train(X_testing, Y_testing, 30, lr, kl_beta)
     print(compression_model.calculate_pnsr(X_testing, Y_testing))
     print(compression_model.calculate_bpp(X_testing, Y_testing))
+
+    encoder = models.Encoder(compression_model)
 
 
 
