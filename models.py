@@ -1,4 +1,4 @@
-import utils
+import utils, encoding
 
 from torch import nn
 from torch.optim import Adam, lr_scheduler
@@ -139,7 +139,7 @@ class Trainer(nn.Module):
             w_std = (1 / dim_fourier) if i == 0 else (np.sqrt(c / dim_hidden) / w0)
 
             nn.init.constant_(layer.mu, 0)
-            nn.init.constant_(layer.log_std, w_std * 0.5)  # init_std_scale param from COMBINER
+            nn.init.constant_(layer.log_std, w_std * 0.25)  # init_std_scale param from COMBINER
 
         self.st = lambda x: F.softplus(x, beta=1, threshold=20)
         self.mse = torch.nn.MSELoss()
@@ -232,8 +232,9 @@ class Trainer(nn.Module):
 
 
 class Encoder(nn.Module):
-    def __init__(self, trainer, kl_beta):
+    def __init__(self, args, trainer, kl_beta):
         super().__init__()
+        self.args = args
         self.trainer = trainer
         self.sample = self.gen_empty_sample(self.trainer.params)
         self.mask = copy.deepcopy(self.sample)
@@ -247,6 +248,7 @@ class Encoder(nn.Module):
         epochs,
         lr,
     ):
+        self.init_opt(lr, epochs)
         for epoch in range(epochs):
             self.opt.zero_grad()
 
@@ -254,7 +256,7 @@ class Encoder(nn.Module):
 
             mse = self.trainer.mse(Y_hat, Y)
 
-            kld_beta = sum([(kl2 * beta).sum() for kl2, beta in zip(self.kld_list(), self.beta_list)])
+            kld_beta = sum([(kl2 * beta.view(-1)).sum() for kl2, beta in zip(self.kld_list(), self.beta_list)])
 
             loss = mse + kld_beta
 
@@ -275,11 +277,11 @@ class Encoder(nn.Module):
 
             if group_kl_sum > (16 + 0.2):  # TODO: make parameters
                 for layer_id, index, _ in group:
-                    if self.mask[layer_id].view(-1)[index] == 0:
+                    if self.mask[f"layers.{layer_id}.mu"].view(-1)[index] == 0:
                        new_beta_list[layer_id].view(-1)[index] *= 1.1
             elif group_kl_sum < (16 - 0.2):  # TODO: make parameters
                 for layer_id, index, _ in group:
-                    if self.mask[layer_id].view(-1)[index] == 0:
+                    if self.mask[f"layers.{layer_id}.mu"].view(-1)[index] == 0:
                        new_beta_list[layer_id].view(-1)[index] /= 1.1
         self.beta_list = new_beta_list
 
@@ -292,9 +294,9 @@ class Encoder(nn.Module):
         merged_params = dict()
         for k in model_params.keys():
             if "mu" in k:
-                merged_params[k] = (1 - mask) * model_params[k] + mask * sample[k]
+                merged_params[k] = (1 - mask[k]) * model_params[k] + mask[k] * sample[k]
             elif "log_std" in k:
-                merged_params[k] = (1 - mask) * model_params[k]
+                merged_params[k] = (1 - mask[k.replace("log_std", "mu")]) * model_params[k] - mask[k.replace("log_std", "mu")] * 1000
             else:
                 raise ValueError(f"Unknown parameter key {k} encountered during merging")
         return merged_params
@@ -325,7 +327,7 @@ class Encoder(nn.Module):
         lr,
         epochs,
     ):
-        self.opt = Adam(self.params.values(), lr=lr)
+        self.opt = Adam(self.trainer.params.values(), lr=lr)
         self.sched = lr_scheduler.MultiStepLR(self.opt, milestones=[int(epochs * 0.8)], gamma=0.5)
 
     def gen_groups(
@@ -346,7 +348,7 @@ class Encoder(nn.Module):
         shuffled_indexes = torch.randperm(len(indexed_kl2))
         shuffled_indexed_kl2 = indexed_kl2[shuffled_indexes]
 
-        groups = current_group = []
+        groups, current_group = [], []
         current_count = current_sum = 0
 
         for dim in shuffled_indexed_kl2:
@@ -354,7 +356,8 @@ class Encoder(nn.Module):
                 groups.append(current_group)
                 current_group = []
                 current_sum = current_count = 0
-            current_group.append(dim.tolist())
+            d = dim.tolist()
+            current_group.append([int(d[0]), int(d[1]), d[2]])
             current_sum += dim[2].item()
             current_count += 1
         if current_group:
@@ -379,6 +382,8 @@ class Encoder(nn.Module):
         lr,
     ):
         for group_id, group in enumerate(self.groups):
+            if not group:
+                continue
             with torch.no_grad():
                 sample_index = self.encode_group(group)
             num_tune = 100  # TODO: maybe call num_tune func?
@@ -390,17 +395,44 @@ class Encoder(nn.Module):
         self,
         group,
     ):
-        mu_q_rec = torch.zeros([len(group)])
-        std_q_rec = torch.zeros([len(group)])
-        mu_p_rec = torch.zeros([len(group)])
-        std_p_rec = torch.zeros([len(group)])
+        group_len = len(group)
+        n_images = self.mask[f"layers.0.mu"].shape[0]
+        mu_q_rec = torch.zeros(n_images, group_len)
+        std_q_rec = torch.zeros(n_images, group_len)
+        mu_p_rec = torch.zeros(group_len)
+        std_p_rec = torch.zeros(group_len)
+
+        for i, (layer_id, index, _) in enumerate(group):
+            row_size = self.trainer.prior.layers[layer_id].mu.size(1)
+            row, col = index // row_size, index % row_size
+            self.mask[f"layers.{layer_id}.mu"][:, row, col] = 1
+            #mu_q_rec[i] = model.net[layer_id].mu.data[row, col]
+            mu_q_rec[:, i] = self.trainer.params[f"layers.{layer_id}.mu"].data[:, row, col]
+            #std_q_rec[i] = SmoothStd(model.net[layer_id].std.data)[row, col]
+            std_q_rec[:, i] = self.trainer.st(self.trainer.params[f"layers.{layer_id}.log_std"].data)[:, row, col]
+            #mu_p_rec[i] = p_mu_list[layer_id][row, col]
+            mu_p_rec[i] = self.trainer.prior.layers[layer_id].mu[row,col]
+            #std_p_rec[i] = p_std_list[layer_id][row, col]
+            std_p_rec[i] = self.trainer.prior.layers[layer_id].log_std[row,col]
+
+        #print(encoding.iREC(self.args, mu_q_rec, std_q_rec, mu_p_rec, std_p_rec))
+        sample, index = encoding.iREC(self.args, mu_q_rec, std_q_rec, mu_p_rec, std_p_rec)
+        #print(sample, index)
+        #sample, index = _, _
 
         for i, (layer_id, index, _) in enumerate(group):
             row_size = self.trainer.prior.layers[layer_id].mu.size(1)
             row, col = index // row_size, index % row_size
 
-            self.mask[layer_id][row, col] = 1
-            mu_q_rec[i] = model.net[layer_id].mu.data[row, col]
-            std_q_rec[i] = SmoothStd(model.net[layer_id].std.data)[row, col]
-            mu_p_rec[i] = p_mu_list[layer_id][row, col]
-            std_p_rec[i] = p_std_list[layer_id][row, col]
+            #print(f"{self.sample[f'layers.{layer_id}.mu'][:, row, col].shape=}")
+            #print(f"{sample[:, i].shape=}")
+            #print(sample)
+            self.sample[f"layers.{layer_id}.mu"][:, row, col] = sample[:, i]
+
+        return index
+
+    def calculate_pnsr(self, X, Y):
+        Y_hat = self(X)
+        Y_hat = torch.clamp(Y_hat, 0., 1.)
+        Y_hat = torch.round(Y_hat * 255) / 255
+        return 20. * np.log10(1.) - 10. * (Y_hat - Y).detach().pow(2).mean().log10().cpu().item()

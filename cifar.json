@@ -2,8 +2,8 @@
   "name": "cifar",
   "dataset": "CIFAR10",
   "dataset_directory": "../IIB-project/recombiner-bones/trainset/",
-  "train_size": 10,
-  "test_size": 2,
+  "train_size": 1000,
+  "test_size": 100,
   "seed": 63759,
   "device": "cuda",
   "dim_in": 2,
@@ -13,7 +13,11 @@
   "num_layers": 5,
   "lr": 2e-4,
   "kl_beta": 5e-6,
-  "n_em_iters": 12,
+  "kl2_budget": 16,
+  "buffer_range": 0.2,
+  "max_group_size": 25,
+  "n_em_iters": 128,
   "n_epochs": 100,
-  "log_std_init": -10
+  "log_std_init": -10,
+  "seed_rec": 22
 }
