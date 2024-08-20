@@ -1,4 +1,5 @@
-import utils, encoding
+import utils
+import encoding
 
 from torch import nn
 from torch.optim import Adam, lr_scheduler
@@ -100,17 +101,25 @@ class ImageINR(nn.Module):
 class Trainer(nn.Module):
     def __init__(
         self,
+        args,
         size,
-        dim_in,
-        dim_fourier,
-        dim_hidden,
-        dim_out,
-        num_layers,
-        std_init,
+        dim_in=None,
+        dim_fourier=None,
+        dim_hidden=None,
+        dim_out=None,
+        num_layers=None,
+        std_init=None,
         w0=30,
         c=6,
     ):
         super().__init__()
+        self.args = args
+        dim_in = dim_in or args.dim_in
+        dim_fourier = dim_fourier or args.dim_fourier
+        dim_hidden = dim_hidden or args.dim_hidden
+        dim_out = dim_out or args.dim_out
+        num_layers = num_layers or args.num_layers
+        std_init = std_init or args.log_std_init
         representations = nn.ModuleList([
             ImageINR(
                 dim_in=dim_in,
@@ -121,11 +130,11 @@ class Trainer(nn.Module):
                 std_init=std_init,
                 w0=w0,
                 c=c,
-            ).to("cuda") for _ in range(size)  # complains if .to is removed :shrug:
+            ).to(self.args.device) for _ in range(size)
         ])
-        self.params, self.buffers = stack_module_state(representations)
+        self.params, _ = stack_module_state(representations)
         self.best_params = copy.deepcopy(self.params)
-        self.best_losses = torch.Tensor([np.inf for _ in range(size)]).to("cuda")
+        self.best_losses = torch.Tensor([np.inf for _ in range(size)]).to(self.args.device)
 
         self.prior = ImageINR(
             dim_in=dim_in,
@@ -141,13 +150,12 @@ class Trainer(nn.Module):
             w_std = (1 / dim_fourier) if i == 0 else (np.sqrt(c / dim_hidden) / w0)
 
             nn.init.constant_(layer.mu, 0)
-            nn.init.constant_(layer.log_std, w_std * 0.25)  # init_std_scale param from COMBINER
+            nn.init.constant_(layer.log_std, w_std * self.args.init_std_scale)
 
         self.st = lambda x: F.softplus(x, beta=1, threshold=20)
         self.mse = torch.nn.MSELoss(reduction="none")
         self.base_model = [copy.deepcopy(self.prior).to("meta")]
         self.size = size
-
 
     def update_best(self, losses):
         with torch.no_grad():
@@ -160,8 +168,7 @@ class Trainer(nn.Module):
         X,
     ):
         X = torch.vmap(self.convert_posenc)(X)
-        return torch.vmap(self.fmodel, randomness="different")(self.params, self.buffers, X)
-
+        return torch.vmap(self.fmodel, randomness="different")(self.params, {}, X)
 
     def convert_posenc(self, x):
         if x.dim() == 0:
@@ -199,12 +206,10 @@ class Trainer(nn.Module):
             self.opt.step()
             self.sched.step()
         self.params = copy.deepcopy(self.best_params)
-        self.best_losses = torch.Tensor([np.inf for _ in range(self.size)]).to("cuda")
-
+        self.best_losses = torch.Tensor([np.inf for _ in range(self.size)]).to(self.args.device)
 
     def fmodel(self, params, buffers, x):
-        return functional_call(self.base_model[0], (params, buffers), (x,))  # (x,)
-
+        return functional_call(self.base_model[0], (params, buffers), (x,))
 
     def init_opt(
         self,
@@ -215,7 +220,6 @@ class Trainer(nn.Module):
 
         self.opt = Adam(self.params.values(), lr=lr)
         self.sched = lr_scheduler.MultiStepLR(self.opt, milestones=[int(epochs * 0.8)], gamma=0.5)
-
 
     def kld(self):
         prior_params = dict(self.prior.named_parameters())
@@ -254,10 +258,10 @@ class Encoder(nn.Module):
         self.beta_list = copy.deepcopy(self.sample)
         for _, v in self.beta_list.items():
             torch.fill_(v, kl_beta)
-        self.groups = self.gen_groups(16, 25)  # TODO: make args parameters
+        self.groups = self.gen_groups(args.kl2_budget, args.max_group_size)
 
         self.best_params = copy.deepcopy(self.trainer.params)
-        self.best_PSNR = torch.Tensor([0 for _ in range(self.trainer.size)]).to("cuda")
+        self.best_PSNR = torch.Tensor([0 for _ in range(self.trainer.size)]).to(args.device)
 
     @utils.time_tracking_decorator
     def train(
@@ -282,13 +286,13 @@ class Encoder(nn.Module):
             self.opt.step()
             self.sched.step()
 
-            if epoch > epochs // 10 and epoch % 15 == 0:  # TODO: make beta_adjust_interval a args
+            if epoch > epochs // 10 and epoch % self.args.beta_adjust_interval == 0:
                 self.adjust_beta_list()
 
             self.update_best(X, Y)
 
         self.trainer.params = copy.deepcopy(self.best_params)
-        self.best_PSNR = torch.Tensor([0 for _ in range(self.trainer.size)]).to("cuda")
+        self.best_PSNR = torch.Tensor([0 for _ in range(self.trainer.size)]).to(self.args.device)
 
     def update_best(self, X, Y):
         list_PSNR = self.calculate_pnsr(X, Y)
@@ -304,15 +308,14 @@ class Encoder(nn.Module):
         kld_list = self.kld_list()
         n_images = self.mask[f"layers.0.mu"].shape[0]
         for group in self.groups:
-            #sum([(kld * beta).sum() for kld, beta in zip(self.kld_list(), self.beta_list)])
             group_kl_sum = np.array([kld_list[layer_id].view(n_images, -1)[:, index].detach().cpu().numpy() / np.log(2) for layer_id, index, _ in group])
 
-            group_kl_sum = torch.Tensor(group_kl_sum.sum(axis=0)).to("cuda")
+            group_kl_sum = torch.Tensor(group_kl_sum.sum(axis=0)).to(self.args.device)
 
             for layer_id, index, _ in group:
                 if self.mask[f"layers.{layer_id}.mu"].view(-1)[index] == 0:
-                    multiplier = torch.where(group_kl_sum > (16 + 0.2), 1.05, 1)
-                    multiplier = torch.where(group_kl_sum < (16 - 0.2), 1/1.05, multiplier)
+                    multiplier = torch.where(group_kl_sum > (self.args.kl2_budget + self.args.kl2_buffer), self.args.beta_adjust_multiplier, 1)
+                    multiplier = torch.where(group_kl_sum < (self.args.kl2_budget - self.args.kl2_buffer), 1/self.args.beta_adjust_multiplier, multiplier)
                     self.beta_list[f"layers.{layer_id}.mu"].view(n_images, -1)[:, index] *= multiplier
 
 
@@ -373,7 +376,7 @@ class Encoder(nn.Module):
 
         indices = torch.cat([
             torch.tensor([(layer_id, index) for index in range(len(tensor))]) for layer_id, tensor in enumerate(kl2_list)
-        ]).to("cuda")  # TODO: args device
+        ]).to(self.args.device)
 
         indexed_kl2 = torch.vstack((indices.T, kl2_cat)).T
 
@@ -418,9 +421,9 @@ class Encoder(nn.Module):
                 continue
             with torch.no_grad():
                 sample_index = self.encode_group(group)
-            num_tune = 100  # TODO: maybe call num_tune func?
+            num_tune = self.args.num_tune
             self.train(X, Y, num_tune, lr)
-            if group_id % 15 == 0:
+            if group_id % self.args.beta_adjust_interval == 0:
                 self.adjust_beta_list()
 
     @utils.time_tracking_decorator
@@ -439,27 +442,19 @@ class Encoder(nn.Module):
             row_size = self.trainer.prior.layers[layer_id].mu.size(1)
             row, col = index // row_size, index % row_size
             self.mask[f"layers.{layer_id}.mu"][:, row, col] = 1
-            #mu_q_rec[i] = model.net[layer_id].mu.data[row, col]
+
             mu_q_rec[:, i] = self.trainer.params[f"layers.{layer_id}.mu"].data[:, row, col]
-            #std_q_rec[i] = SmoothStd(model.net[layer_id].std.data)[row, col]
             std_q_rec[:, i] = self.trainer.st(self.trainer.params[f"layers.{layer_id}.log_std"].data)[:, row, col]
-            #mu_p_rec[i] = p_mu_list[layer_id][row, col]
             mu_p_rec[i] = self.trainer.prior.layers[layer_id].mu[row,col]
-            #std_p_rec[i] = p_std_list[layer_id][row, col]
             std_p_rec[i] = self.trainer.prior.layers[layer_id].log_std[row,col]
 
-        #print(encoding.iREC(self.args, mu_q_rec, std_q_rec, mu_p_rec, std_p_rec))
         sample, index = encoding.iREC(self.args, mu_q_rec, std_q_rec, mu_p_rec, std_p_rec)
-        #print(sample, index)
-        #sample, index = _, _
+
 
         for i, (layer_id, index, _) in enumerate(group):
             row_size = self.trainer.prior.layers[layer_id].mu.size(1)
             row, col = index // row_size, index % row_size
 
-            #print(f"{self.sample[f'layers.{layer_id}.mu'][:, row, col].shape=}")
-            #print(f"{sample[:, i].shape=}")
-            #print(sample)
             self.sample[f"layers.{layer_id}.mu"][:, row, col] = sample[:, i]
 
         return index
