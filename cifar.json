@@ -7,7 +7,6 @@
   "test_size": 100,
 
   "seed": 63759,
-  "seed_rec": 63759,
 
   "device": "cuda",
 

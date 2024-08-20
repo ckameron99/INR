@@ -5,8 +5,8 @@ from torch.quasirandom import SobolEngine
 from scipy.stats import norm
 
 
-def prior_samples(n_samples, n_variable, seed_rec):
-    sobol = SobolEngine(n_variable, scramble=True, seed=seed_rec)
+def prior_samples(n_samples, n_variable, seed):
+    sobol = SobolEngine(n_variable, scramble=True, seed=seed)
     samples_sobol = sobol.draw(n_samples)
     samples_i = torch.from_numpy(norm.ppf(samples_sobol))
     samples_i = torch.clamp(samples_i, -10, 10)
@@ -33,7 +33,7 @@ def single_iREC(args, mu_q, std_q, mu_p, std_p):
     normal_dist = Normal(mu_p * torch.ones(N, n_samples, n_variable),
                         std_p * torch.ones(N, n_samples, n_variable))
 
-    xs = prior_samples(n_samples, n_variable, args.seed_rec) * std_p + mu_p
+    xs = prior_samples(n_samples, n_variable, args.seed) * std_p + mu_p
     xs = xs.unsqueeze(0)
 
     q_normal_dist = Normal(mu_q, std_q)
