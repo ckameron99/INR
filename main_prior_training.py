@@ -37,27 +37,13 @@ def main():
     X_testing, Y_testing = X_testing.to(args.device), Y_testing.to(args.device)
 
     prior_model = models.Trainer(
+        args,
         size=args.train_size,
-        dim_in=args.dim_in,
-        dim_fourier=args.dim_fourier,
-        dim_hidden=args.dim_hidden,
-        dim_out=args.dim_out,
-        num_layers=args.num_layers,
-        std_init=args.log_std_init,
     ).to(args.device)
 
-    """print(prior_model.calculate_pnsr(X, Y))
-    print(prior_model.calculate_bpp(X, Y))
-    prior_model.update_prior()
-    print(prior_model.calculate_bpp(X, Y))
-    utils.cum_dist(prior_model)
-    exit()"""
-
-    lr = args.lr
-    kl_beta = args.kl_beta
-    prior_model.train(X, Y, args.n_epochs*2, lr, kl_beta)
+    prior_model.train(X, Y, args.n_epochs*2, args.lr, args.kl_beta)
     for _ in tqdm(range(args.n_em_iters)):
-        prior_model.train(X, Y, args.n_epochs, lr, kl_beta)
+        prior_model.train(X, Y, args.n_epochs, args.lr, args.kl_beta)
         prior_model.update_prior()
 
     print(prior_model.calculate_pnsr(X, Y))
@@ -65,29 +51,24 @@ def main():
     print()
 
     compression_model = models.Trainer(
-        size=args.test_size,
-        dim_in=args.dim_in,
-        dim_fourier=args.dim_fourier,
-        dim_hidden=args.dim_hidden,
-        dim_out=args.dim_out,
-        num_layers=args.num_layers,
-        std_init=args.log_std_init,
+        args,
+        size=args.test_size
     ).to(args.device)
 
 
     compression_model.prior.load_state_dict(prior_model.prior.state_dict())
-    compression_model.train(X_testing, Y_testing, args.comp_epochs, lr, kl_beta)
+    compression_model.train(X_testing, Y_testing, args.comp_epochs, args.lr, args.kl_beta)
     print(compression_model.calculate_pnsr(X_testing, Y_testing))
     print(compression_model.calculate_bpp(X_testing, Y_testing))
     print()
 
-    encoder = models.Encoder(args, compression_model, kl_beta=kl_beta)
-    encoder.train(X_testing, Y_testing, 30_000, lr)
+    encoder = models.Encoder(args, compression_model, kl_beta=args.kl_beta)
+    encoder.train(X_testing, Y_testing, 30_000, args.lr)
     print(encoder.calculate_pnsr(X_testing, Y_testing).mean())
     print(len(encoder.groups) * args.kl2_budget / 32 / 32)
     print()
 
-    encoder.progressive_encode(X_testing, Y_testing, lr)
+    encoder.progressive_encode(X_testing, Y_testing, args.lr)
 
     print(encoder.calculate_pnsr(X_testing, Y_testing).mean())
     print(len(encoder.groups) * args.kl2_budget / 32 / 32)

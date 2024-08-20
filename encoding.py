@@ -15,7 +15,7 @@ def prior_samples(n_samples, n_variable, seed_rec):
 def iREC(args, mu_q, std_q, mu_p, std_p):
     res = [single_iREC(args, single_mu_q, single_std_q, mu_p, std_p) for (single_mu_q, single_std_q) in zip(mu_q, std_q)]
 
-    sample = torch.stack([r[0] for r in res])  # TODO: maybe should be vstack?
+    sample = torch.stack([r[0] for r in res])
     index = torch.Tensor([r[1] for r in res])
 
     return sample, index
