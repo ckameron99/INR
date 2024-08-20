@@ -4,6 +4,10 @@ from torchvision.transforms import ToTensor
 import torch
 import matplotlib.pyplot as plt
 import numpy as np
+import time
+import atexit
+from functools import wraps
+
 
 
 def load_dataset(training_images_path):
@@ -55,3 +59,27 @@ def cum_dist(model):
 
     plt.tight_layout()
     plt.show()
+
+class MethodTimeTracker:
+    def __init__(self):
+        self.cumulative_time = 0
+
+    def __call__(self, func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            start_time = time.time()
+            result = func(*args, **kwargs)
+            end_time = time.time()
+            elapsed_time = end_time - start_time
+            self.cumulative_time += elapsed_time
+            return result
+
+        return wrapper
+
+    def report(self, method_name):
+        print(f"Total time spent in {method_name}: {self.cumulative_time:.4f} seconds")
+
+def time_tracking_decorator(method):
+    tracker = MethodTimeTracker()
+    atexit.register(tracker.report, method.__name__)
+    return tracker(method)

@@ -238,9 +238,13 @@ class Encoder(nn.Module):
         self.trainer = trainer
         self.sample = self.gen_empty_sample(self.trainer.params)
         self.mask = copy.deepcopy(self.sample)
+        self.beta_list = copy.deepcopy(self.sample)
+        for _, v in self.beta_list.items():
+            torch.fill_(v, kl_beta)
         self.groups = self.gen_groups(16, 25)  # TODO: make args parameters
-        self.beta_list = [torch.ones_like(layer.mu) * kl_beta for layer in self.trainer.prior.layers]
+        #self.beta_list = [torch.ones_like(layer.mu) * kl_beta for layer in self.trainer.prior.layers]
 
+    @utils.time_tracking_decorator
     def train(
         self,
         X,
@@ -255,8 +259,7 @@ class Encoder(nn.Module):
             Y_hat = self(X)
 
             mse = self.trainer.mse(Y_hat, Y)
-
-            kld_beta = sum([(kl2 * beta.view(-1)).sum() for kl2, beta in zip(self.kld_list(), self.beta_list)])
+            kld_beta = sum([(kld * self.beta_list[f"layers.{layer_id}.mu"]).mean(0).sum() for layer_id, kld in enumerate(self.kld_list())])
 
             loss = mse + kld_beta
 
@@ -264,26 +267,28 @@ class Encoder(nn.Module):
             self.opt.step()
             self.sched.step()
 
-            if epoch > epochs // 10 and epoch % 100 == 0:  # TODO: make beta_adjust_interval a args
+            if epoch > epochs // 10 and epoch % 15 == 0:  # TODO: make beta_adjust_interval a args
                 self.adjust_beta_list()
 
+    @utils.time_tracking_decorator
     def adjust_beta_list(
         self,
     ):
-        new_beta_list = [beta.clone() for beta in self.beta_list]
         kld_list = self.kld_list()
+        n_images = self.mask[f"layers.0.mu"].shape[0]
         for group in self.groups:
-            group_kl_sum = sum([kld_list[layer_id].view(-1)[index].item() / np.log(2) for layer_id, index, _ in group])
+            #sum([(kld * beta).sum() for kld, beta in zip(self.kld_list(), self.beta_list)])
+            group_kl_sum = np.array([kld_list[layer_id].view(n_images, -1)[:, index].detach().cpu().numpy() / np.log(2) for layer_id, index, _ in group])
 
-            if group_kl_sum > (16 + 0.2):  # TODO: make parameters
-                for layer_id, index, _ in group:
-                    if self.mask[f"layers.{layer_id}.mu"].view(-1)[index] == 0:
-                       new_beta_list[layer_id].view(-1)[index] *= 1.1
-            elif group_kl_sum < (16 - 0.2):  # TODO: make parameters
-                for layer_id, index, _ in group:
-                    if self.mask[f"layers.{layer_id}.mu"].view(-1)[index] == 0:
-                       new_beta_list[layer_id].view(-1)[index] /= 1.1
-        self.beta_list = new_beta_list
+            group_kl_sum = torch.Tensor(group_kl_sum.sum(axis=0)).to("cuda")
+
+            for layer_id, index, _ in group:
+                if self.mask[f"layers.{layer_id}.mu"].view(-1)[index] == 0:
+                    multiplier = torch.where(group_kl_sum > (16 + 0.2), 1.05, 1)
+                    multiplier = torch.where(group_kl_sum < (16 - 0.2), 1/1.05, multiplier)
+                    self.beta_list[f"layers.{layer_id}.mu"].view(n_images, -1)[:, index] *= multiplier
+
+
 
     def merge_params(
         self,
@@ -336,7 +341,7 @@ class Encoder(nn.Module):
         max_group_size,
     ):
         kld_list = self.kld_list()
-        kl2_list = [kld / np.log(2) for kld in kld_list]
+        kl2_list = [kld.mean(0).view(-1) / np.log(2) for kld in kld_list]
         kl2_cat = torch.cat(kl2_list)
 
         indices = torch.cat([
@@ -363,17 +368,17 @@ class Encoder(nn.Module):
         if current_group:
             groups.append(current_group)
 
-        return groups
+        return list(filter(None, groups))
 
     def kld_list(
         self,
     ):
         prior_params = dict(self.trainer.prior.named_parameters())
-        kl2 = [kl_divergence(
+        kld = [kl_divergence(
                 Normal(self.trainer.params[f"layers.{i}.mu"], self.trainer.st(self.trainer.params[f"layers.{i}.log_std"])),
                 Normal(prior_params[f"layers.{i}.mu"], prior_params[f"layers.{i}.log_std"])
-            ).mean(0).view(-1) for i in range(len(self.trainer.prior.layers))]
-        return kl2
+            ) for i in range(len(self.trainer.prior.layers))]
+        return kld
 
     def progressive_encode(
         self,
@@ -388,9 +393,10 @@ class Encoder(nn.Module):
                 sample_index = self.encode_group(group)
             num_tune = 100  # TODO: maybe call num_tune func?
             self.train(X, Y, num_tune, lr)
-            if group_id % 10 == 0:
+            if group_id % 15 == 0:
                 self.adjust_beta_list()
 
+    @utils.time_tracking_decorator
     def encode_group(
         self,
         group,

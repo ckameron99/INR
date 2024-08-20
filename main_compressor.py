@@ -5,7 +5,9 @@ import argparse
 import json
 import numpy as np
 import os
+import torch
 from tqdm import tqdm
+import pickle
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -36,34 +38,6 @@ def main():
     X_testing, Y_testing = utils.load_dataset(testing_images_path)
     X_testing, Y_testing = X_testing.to(args.device), Y_testing.to(args.device)
 
-    prior_model = models.Trainer(
-        size=args.train_size,
-        dim_in=args.dim_in,
-        dim_fourier=args.dim_fourier,
-        dim_hidden=args.dim_hidden,
-        dim_out=args.dim_out,
-        num_layers=args.num_layers,
-        std_init=args.log_std_init,
-    ).to(args.device)
-
-    """print(prior_model.calculate_pnsr(X, Y))
-    print(prior_model.calculate_bpp(X, Y))
-    prior_model.update_prior()
-    print(prior_model.calculate_bpp(X, Y))
-    utils.cum_dist(prior_model)
-    exit()"""
-
-    lr = args.lr
-    kl_beta = args.kl_beta
-    prior_model.train(X, Y, args.n_epochs*2, lr, kl_beta)
-    for _ in tqdm(range(args.n_em_iters)):
-        prior_model.train(X, Y, args.n_epochs, lr, kl_beta)
-        prior_model.update_prior()
-
-    print(prior_model.calculate_pnsr(X, Y))
-    print(prior_model.calculate_bpp(X, Y))
-    print()
-
     compression_model = models.Trainer(
         size=args.test_size,
         dim_in=args.dim_in,
@@ -75,25 +49,42 @@ def main():
     ).to(args.device)
 
 
-    compression_model.prior.load_state_dict(prior_model.prior.state_dict())
-    #compression_model.train(X_testing, Y_testing, args.comp_epochs, lr, kl_beta)
+    state_dict_map = {
+        "priors_mu.0": "layers.0.mu",
+        "priors_mu.1": "layers.1.mu",
+        "priors_mu.2": "layers.2.mu",
+        "priors_mu.3": "layers.3.mu",
+        "priors_std.0": "layers.0.log_std",
+        "priors_std.1": "layers.1.log_std",
+        "priors_std.2": "layers.2.log_std",
+        "priors_std.3": "layers.3.log_std",
+    }
+    prior_state_dict = torch.load(os.path.join("Cifar_num4_emd32_lat16_beta2e-05", "model_prior_latest.pt"))
+    prior_state_dict = dict((state_dict_map[key], value) for key, value in prior_state_dict.items())
+    compression_model.prior.load_state_dict(prior_state_dict)
+    #compression_model.train(X_testing, Y_testing, args.comp_epochs, args.lr, args.kl_beta)
     #print(compression_model.calculate_pnsr(X_testing, Y_testing))
     #print(compression_model.calculate_bpp(X_testing, Y_testing))
     #print()
 
-    encoder = models.Encoder(args, compression_model, kl_beta=kl_beta)
-    encoder.train(X_testing, Y_testing, 30_000, lr)
+    encoder = models.Encoder(args, compression_model, kl_beta=args.kl_beta)
+
+    with open(os.path.join("Cifar_num4_emd32_lat16_beta2e-05", "groups.pkl"), "rb") as f:
+        encoder.groups = pickle.load(f)
+        print(len(encoder.groups))
+        exit()
+
+
+    encoder.train(X_testing, Y_testing, args.comp_epochs, args.lr)
     print(encoder.calculate_pnsr(X_testing, Y_testing))
     print(len(encoder.groups) * args.kl2_budget / 32 / 32)
     print()
 
-    encoder.progressive_encode(X_testing, Y_testing, lr)
+    encoder.progressive_encode(X_testing, Y_testing, args.lr)
 
     print(encoder.calculate_pnsr(X_testing, Y_testing))
     print(len(encoder.groups) * args.kl2_budget / 32 / 32)
     print()
-
-
 
 
 if __name__ == "__main__":
