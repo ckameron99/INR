@@ -124,6 +124,8 @@ class Trainer(nn.Module):
             ).to("cuda") for _ in range(size)  # complains if .to is removed :shrug:
         ])
         self.params, self.buffers = stack_module_state(representations)
+        self.best_params = copy.deepcopy(self.params)
+        self.best_losses = torch.Tensor([np.inf for _ in range(size)]).to("cuda")
 
         self.prior = ImageINR(
             dim_in=dim_in,
@@ -142,10 +144,16 @@ class Trainer(nn.Module):
             nn.init.constant_(layer.log_std, w_std * 0.25)  # init_std_scale param from COMBINER
 
         self.st = lambda x: F.softplus(x, beta=1, threshold=20)
-        self.mse = torch.nn.MSELoss()
+        self.mse = torch.nn.MSELoss(reduction="none")
         self.base_model = [copy.deepcopy(self.prior).to("meta")]
         self.size = size
 
+
+    def update_best(self, losses):
+        with torch.no_grad():
+            for k in self.params.keys():
+                self.best_params[k][losses<self.best_losses] = self.params[k][losses<self.best_losses].detach()
+            self.best_losses = torch.min(self.best_losses, losses.detach())
 
     def forward(
         self,
@@ -179,15 +187,20 @@ class Trainer(nn.Module):
 
             Y_hat = self(X)
 
-            mse = self.mse(Y_hat, Y)
+            mse = self.mse(Y_hat, Y).mean((1,2))
 
             kld = self.kld()
 
             loss = mse + kld * kl_beta
+            self.update_best(loss)
 
+            loss = loss.sum()
             loss.backward()
             self.opt.step()
             self.sched.step()
+        self.params = copy.deepcopy(self.best_params)
+        self.best_losses = torch.Tensor([np.inf for _ in range(self.size)]).to("cuda")
+
 
     def fmodel(self, params, buffers, x):
         return functional_call(self.base_model[0], (params, buffers), (x,))  # (x,)
@@ -206,10 +219,10 @@ class Trainer(nn.Module):
 
     def kld(self):
         prior_params = dict(self.prior.named_parameters())
-        return sum([kl_divergence(
+        return torch.stack([kl_divergence(
                 Normal(self.params[f"layers.{i}.mu"], self.st(self.params[f"layers.{i}.log_std"])),
                 Normal(prior_params[f"layers.{i}.mu"], prior_params[f"layers.{i}.log_std"])
-            ).sum() for i in range(len(self.prior.layers))]) / self.size
+            ).sum((1, 2)) for i in range(len(self.prior.layers))]).sum(0)
 
     def update_prior(self):
         with torch.no_grad():
@@ -228,7 +241,7 @@ class Trainer(nn.Module):
         return 20. * np.log10(1.) - 10. * (Y_hat - Y).detach().pow(2).mean().log10().cpu().item()
 
     def calculate_bpp(self, X, Y):
-        return self.kld() / X.shape[1] / np.log(2)
+        return torch.mean(self.kld()) / X.shape[1] / np.log(2)
 
 
 class Encoder(nn.Module):
@@ -242,7 +255,9 @@ class Encoder(nn.Module):
         for _, v in self.beta_list.items():
             torch.fill_(v, kl_beta)
         self.groups = self.gen_groups(16, 25)  # TODO: make args parameters
-        #self.beta_list = [torch.ones_like(layer.mu) * kl_beta for layer in self.trainer.prior.layers]
+
+        self.best_params = copy.deepcopy(self.trainer.params)
+        self.best_PSNR = torch.Tensor([0 for _ in range(self.trainer.size)]).to("cuda")
 
     @utils.time_tracking_decorator
     def train(
@@ -258,7 +273,7 @@ class Encoder(nn.Module):
 
             Y_hat = self(X)
 
-            mse = self.trainer.mse(Y_hat, Y)
+            mse = self.trainer.mse(Y_hat, Y).mean()
             kld_beta = sum([(kld * self.beta_list[f"layers.{layer_id}.mu"]).mean(0).sum() for layer_id, kld in enumerate(self.kld_list())])
 
             loss = mse + kld_beta
@@ -269,6 +284,18 @@ class Encoder(nn.Module):
 
             if epoch > epochs // 10 and epoch % 15 == 0:  # TODO: make beta_adjust_interval a args
                 self.adjust_beta_list()
+
+            self.update_best(X, Y)
+
+        self.trainer.params = copy.deepcopy(self.best_params)
+        self.best_PSNR = torch.Tensor([0 for _ in range(self.trainer.size)]).to("cuda")
+
+    def update_best(self, X, Y):
+        list_PSNR = self.calculate_pnsr(X, Y)
+        with torch.no_grad():
+            for k in self.trainer.params.keys():
+                self.best_params[k][list_PSNR>self.best_PSNR] = self.trainer.params[k][list_PSNR>self.best_PSNR].detach()
+            self.best_PSNR = torch.max(self.best_PSNR, list_PSNR.detach())
 
     @utils.time_tracking_decorator
     def adjust_beta_list(
@@ -441,4 +468,4 @@ class Encoder(nn.Module):
         Y_hat = self(X)
         Y_hat = torch.clamp(Y_hat, 0., 1.)
         Y_hat = torch.round(Y_hat * 255) / 255
-        return 20. * np.log10(1.) - 10. * (Y_hat - Y).detach().pow(2).mean().log10().cpu().item()
+        return 20. * np.log10(1.) - 10. * (Y_hat - Y).detach().pow(2).mean((1,2)).log10()
