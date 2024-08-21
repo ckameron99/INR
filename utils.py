@@ -1,6 +1,5 @@
 import hashlib
-from PIL import Image
-from torchvision.transforms import ToTensor
+
 import torch
 import matplotlib.pyplot as plt
 import numpy as np
@@ -8,30 +7,6 @@ import time
 import atexit
 from functools import wraps
 
-
-
-def load_dataset(training_images_path):
-    if not len(training_images_path):
-        return torch.tensor([]), torch.tensor([])
-    X = []
-    Y = []
-    for path in training_images_path:
-        image = Image.open(path)
-        image = ToTensor()(image)
-        y = image.reshape(image.shape[0], -1).T
-
-
-        l_list = []
-        for _, s in enumerate(image.shape[1:]):
-            l = (1 + 2 * torch.arange(s)) / s
-            l -= 1
-            l_list.append(l)
-        x = torch.meshgrid(*l_list, indexing="ij")
-        x = torch.stack(x, dim=-1).view(-1, 2)
-
-        X.append(x[None, :, :])
-        Y.append(y[None, :, :])
-    return torch.cat(X, dim=0), torch.cat(Y, dim=0)
 
 def checksum(t):
     torch.manual_seed(69)
