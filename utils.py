@@ -1,11 +1,11 @@
+import atexit
 import hashlib
+import time
+from functools import wraps
 
-import torch
 import matplotlib.pyplot as plt
 import numpy as np
-import time
-import atexit
-from functools import wraps
+import torch
 
 
 def checksum(t):

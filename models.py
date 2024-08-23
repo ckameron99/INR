@@ -1,14 +1,16 @@
-import utils
-import encoding
-
-from torch import nn
-from torch.optim import Adam, lr_scheduler
-from torch.distributions import kl_divergence, Normal
-from torch.func import functional_call, stack_module_state
-import torch.nn.functional as F
-import torch
-import numpy as np
 import copy
+import operator
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torch.distributions import Normal, kl_divergence
+from torch.func import functional_call, stack_module_state
+from torch.optim import Adam, lr_scheduler
+
+import encoding
+import utils
 
 
 class VariationalSirenLayer(nn.Module):
@@ -134,7 +136,12 @@ class Trainer(nn.Module):
         ])
         self.params, _ = stack_module_state(representations)
         self.best_params = copy.deepcopy(self.params)
-        self.best_losses = torch.Tensor([np.inf for _ in range(size)]).to(self.args.device)
+        self.best_metric = torch.Tensor([np.nan for _ in range(size)]).to(self.args.device)
+        self.sample = self.gen_empty_sample(self.params)
+        self.mask = copy.deepcopy(self.sample)
+        self.beta_list = copy.deepcopy(self.sample)
+        for _, v in self.beta_list.items():
+            torch.fill_(v, np.nan)
 
         self.prior = ImageINR(
             dim_in=dim_in,
@@ -157,18 +164,44 @@ class Trainer(nn.Module):
         self.base_model = [copy.deepcopy(self.prior).to("meta")]
         self.size = size
 
-    def update_best(self, losses):
+    def update_best(self, tune_beta, loss, X, Y):
+        if tune_beta:
+            metric = self.calculate_pnsr(X, Y)
+            op = operator.le
+            m = torch.fmax
+        else:
+            metric = loss
+            op = operator.ge
+            m = torch.fmin
         with torch.no_grad():
             for k in self.params.keys():
-                self.best_params[k][losses<self.best_losses] = self.params[k][losses<self.best_losses].detach()
-            self.best_losses = torch.min(self.best_losses, losses.detach())
+                self.best_params[k][~op(metric, self.best_metric)] = self.params[k][~op(metric, self.best_metric)].detach()
+            self.best_metric = m(self.best_metric, metric.detach())
 
     def forward(
         self,
         X,
     ):
         X = torch.vmap(self.convert_posenc)(X)
-        return torch.vmap(self.fmodel, randomness="different")(self.params, {}, X)
+        return torch.vmap(self.fmodel, randomness="different")(self.merge_params(self.params, self.sample, self.mask), {}, X)
+
+    def merge_params(
+        self,
+        model_params,
+        sample,
+        mask,
+    ):
+        if not any([torch.any(v) for v in mask.values()]):
+            return model_params
+        merged_params = dict()
+        for k in model_params.keys():
+            if "mu" in k:
+                merged_params[k] = (1 - mask[k]) * model_params[k] + mask[k] * sample[k]
+            elif "log_std" in k:
+                merged_params[k] = (1 - mask[k.replace("log_std", "mu")]) * model_params[k] - mask[k.replace("log_std", "mu")] * 1000
+            else:
+                raise ValueError(f"Unknown parameter key {k} encountered during merging")
+        return merged_params
 
     def convert_posenc(self, x):
         if x.dim() == 0:
@@ -185,9 +218,13 @@ class Trainer(nn.Module):
         Y,
         epochs,
         lr,
-        kl_beta,
+        kl_beta=None,
+        tune_beta=False,
     ):
         self.init_opt(lr, epochs=epochs)
+        if not tune_beta and kl_beta:
+            for _, v in self.beta_list.items():
+                torch.fill_(v, kl_beta)
 
         for epoch in range(epochs):
             self.opt.zero_grad()
@@ -196,17 +233,35 @@ class Trainer(nn.Module):
 
             mse = self.mse(Y_hat, Y).mean((1,2))
 
-            kld = self.kld()
+            kld_beta = torch.stack([(kld * self.beta_list[f"layers.{layer_id}.mu"]).sum((1,2)) for layer_id, kld in enumerate(self.kld_list())]).sum(0)
 
-            loss = mse + kld * kl_beta
-            self.update_best(loss)
+            loss = mse + kld_beta
+
+            self.update_best(tune_beta, loss, X, Y)
 
             loss = loss.sum()
             loss.backward()
             self.opt.step()
             self.sched.step()
+
+            if epoch > epochs // 10 and epoch % self.args.beta_adjust_interval == 0 and tune_beta:
+                self.adjust_beta_list()
+
         self.params = copy.deepcopy(self.best_params)
-        self.best_losses = torch.Tensor([np.inf for _ in range(self.size)]).to(self.args.device)
+        self.best_metric = torch.Tensor([np.nan for _ in range(self.size)]).to(self.args.device)
+
+    def update_best_losses(self, losses):
+            with torch.no_grad():
+                for k in self.params.keys():
+                    self.best_params[k][losses<self.best_metric] = self.params[k][losses<self.best_metric].detach()
+                self.best_metric = torch.min(self.best_metric, losses.detach())
+
+    def update_best_psnr(self, X, Y):
+            list_PSNR = self.calculate_pnsr(X, Y)
+            with torch.no_grad():
+                for k in self.params.keys():
+                    self.best_params[k][list_PSNR>self.best_metric] = self.params[k][list_PSNR>self.best_metric].detach()
+                self.best_metric = torch.max(self.best_metric, list_PSNR.detach())
 
     def fmodel(self, params, buffers, x):
         return functional_call(self.base_model[0], (params, buffers), (x,))
@@ -221,149 +276,15 @@ class Trainer(nn.Module):
         self.opt = Adam(self.params.values(), lr=lr)
         self.sched = lr_scheduler.MultiStepLR(self.opt, milestones=[int(epochs * 0.8)], gamma=0.5)
 
-    def kld(self):
+    def kld_list(
+        self,
+    ):
         prior_params = dict(self.prior.named_parameters())
-        return torch.stack([kl_divergence(
+        kld = [kl_divergence(
                 Normal(self.params[f"layers.{i}.mu"], self.st(self.params[f"layers.{i}.log_std"])),
                 Normal(prior_params[f"layers.{i}.mu"], prior_params[f"layers.{i}.log_std"])
-            ).sum((1, 2)) for i in range(len(self.prior.layers))]).sum(0)
-
-    def update_prior(self):
-        with torch.no_grad():
-            prior_params = dict(self.prior.named_parameters())
-            for i in range(len(self.prior.layers)):
-                prior_params[f"layers.{i}.mu"].copy_(self.params[f"layers.{i}.mu"].clone().detach().mean(0))
-                prior_params[f"layers.{i}.log_std"].copy_(torch.sqrt(
-                    self.params[f"layers.{i}.mu"].clone().detach().var(0) + \
-                    self.st(self.params[f"layers.{i}.log_std"].clone().detach()).pow(2).mean(0)
-                ))
-
-    def calculate_pnsr(self, X, Y):
-        Y_hat = self(X)
-        Y_hat = torch.clamp(Y_hat, 0., 1.)
-        Y_hat = torch.round(Y_hat * 255) / 255
-        return 20. * np.log10(1.) - 10. * (Y_hat - Y).detach().pow(2).mean().log10().cpu().item()
-
-    def calculate_bpp(self, X, Y):
-        return torch.mean(self.kld()) / X.shape[1] / np.log(2)
-
-
-class Encoder(nn.Module):
-    def __init__(self, args, trainer, kl_beta):
-        super().__init__()
-        self.args = args
-        self.trainer = trainer
-        self.sample = self.gen_empty_sample(self.trainer.params)
-        self.mask = copy.deepcopy(self.sample)
-        self.beta_list = copy.deepcopy(self.sample)
-        for _, v in self.beta_list.items():
-            torch.fill_(v, kl_beta)
-        self.groups = self.gen_groups(args.kl2_budget, args.max_group_size)
-
-        self.best_params = copy.deepcopy(self.trainer.params)
-        self.best_PSNR = torch.Tensor([0 for _ in range(self.trainer.size)]).to(args.device)
-
-    @utils.time_tracking_decorator
-    def train(
-        self,
-        X,
-        Y,
-        epochs,
-        lr,
-    ):
-        self.init_opt(lr, epochs)
-        for epoch in range(epochs):
-            self.opt.zero_grad()
-
-            Y_hat = self(X)
-
-            mse = self.trainer.mse(Y_hat, Y).mean()
-            kld_beta = sum([(kld * self.beta_list[f"layers.{layer_id}.mu"]).mean(0).sum() for layer_id, kld in enumerate(self.kld_list())])
-
-            loss = mse + kld_beta
-
-            loss.backward()
-            self.opt.step()
-            self.sched.step()
-
-            if epoch > epochs // 10 and epoch % self.args.beta_adjust_interval == 0:
-                self.adjust_beta_list()
-
-            self.update_best(X, Y)
-
-        self.trainer.params = copy.deepcopy(self.best_params)
-        self.best_PSNR = torch.Tensor([0 for _ in range(self.trainer.size)]).to(self.args.device)
-
-    def update_best(self, X, Y):
-        list_PSNR = self.calculate_pnsr(X, Y)
-        with torch.no_grad():
-            for k in self.trainer.params.keys():
-                self.best_params[k][list_PSNR>self.best_PSNR] = self.trainer.params[k][list_PSNR>self.best_PSNR].detach()
-            self.best_PSNR = torch.max(self.best_PSNR, list_PSNR.detach())
-
-    @utils.time_tracking_decorator
-    def adjust_beta_list(
-        self,
-    ):
-        kld_list = self.kld_list()
-        n_images = self.mask[f"layers.0.mu"].shape[0]
-        for group in self.groups:
-            group_kl_sum = np.array([kld_list[layer_id].view(n_images, -1)[:, index].detach().cpu().numpy() / np.log(2) for layer_id, index, _ in group])
-
-            group_kl_sum = torch.Tensor(group_kl_sum.sum(axis=0)).to(self.args.device)
-
-            for layer_id, index, _ in group:
-                if self.mask[f"layers.{layer_id}.mu"].view(-1)[index] == 0:
-                    multiplier = torch.where(group_kl_sum > (self.args.kl2_budget + self.args.kl2_buffer), self.args.beta_adjust_multiplier, 1)
-                    multiplier = torch.where(group_kl_sum < (self.args.kl2_budget - self.args.kl2_buffer), 1/self.args.beta_adjust_multiplier, multiplier)
-                    self.beta_list[f"layers.{layer_id}.mu"].view(n_images, -1)[:, index] *= multiplier
-
-
-
-    def merge_params(
-        self,
-        model_params,
-        sample,
-        mask,
-    ):
-        merged_params = dict()
-        for k in model_params.keys():
-            if "mu" in k:
-                merged_params[k] = (1 - mask[k]) * model_params[k] + mask[k] * sample[k]
-            elif "log_std" in k:
-                merged_params[k] = (1 - mask[k.replace("log_std", "mu")]) * model_params[k] - mask[k.replace("log_std", "mu")] * 1000
-            else:
-                raise ValueError(f"Unknown parameter key {k} encountered during merging")
-        return merged_params
-
-    def gen_empty_sample(
-        self,
-        model_params,
-    ):
-        sample = dict()
-        for k in model_params.keys():
-            if "mu" in k:
-                sample[k] = torch.zeros_like(model_params[k])
-            elif "log_std" in k:
-                pass
-            else:
-                raise ValueError(f"Unknown parameter key {k} encountered during generation of empty sample")
-        return sample
-
-    def forward(
-        self,
-        X,
-    ):
-        X = torch.vmap(self.trainer.convert_posenc)(X)
-        return torch.vmap(self.trainer.fmodel, randomness="different")(self.merge_params(self.trainer.params, self.sample, self.mask), {}, X)
-
-    def init_opt(
-        self,
-        lr,
-        epochs,
-    ):
-        self.opt = Adam(self.trainer.params.values(), lr=lr)
-        self.sched = lr_scheduler.MultiStepLR(self.opt, milestones=[int(epochs * 0.8)], gamma=0.5)
+            ) for i in range(len(self.prior.layers))]
+        return kld
 
     def gen_groups(
         self,
@@ -398,17 +319,64 @@ class Encoder(nn.Module):
         if current_group:
             groups.append(current_group)
 
-        return list(filter(None, groups))
+        self.groups = list(filter(None, groups))
 
-    def kld_list(
+    def gen_empty_sample(
+        self,
+        model_params,
+    ):
+        sample = dict()
+        for k in model_params.keys():
+            if "mu" in k:
+                sample[k] = torch.zeros_like(model_params[k])
+            elif "log_std" in k:
+                pass
+            else:
+                raise ValueError(f"Unknown parameter key {k} encountered during generation of empty sample")
+        return sample
+
+    def update_prior(self):
+        with torch.no_grad():
+            prior_params = dict(self.prior.named_parameters())
+            for i in range(len(self.prior.layers)):
+                prior_params[f"layers.{i}.mu"].copy_(self.params[f"layers.{i}.mu"].clone().detach().mean(0))
+                prior_params[f"layers.{i}.log_std"].copy_(torch.sqrt(
+                    self.params[f"layers.{i}.mu"].clone().detach().var(0) + \
+                    self.st(self.params[f"layers.{i}.log_std"].clone().detach()).pow(2).mean(0)
+                ))
+
+    @utils.time_tracking_decorator
+    def adjust_beta_list(
         self,
     ):
-        prior_params = dict(self.trainer.prior.named_parameters())
-        kld = [kl_divergence(
-                Normal(self.trainer.params[f"layers.{i}.mu"], self.trainer.st(self.trainer.params[f"layers.{i}.log_std"])),
-                Normal(prior_params[f"layers.{i}.mu"], prior_params[f"layers.{i}.log_std"])
-            ) for i in range(len(self.trainer.prior.layers))]
-        return kld
+        kld_list = self.kld_list()
+        n_images = self.mask[f"layers.0.mu"].shape[0]
+        for group in self.groups:
+            group_kl_sum = np.array([kld_list[layer_id].view(n_images, -1)[:, index].detach().cpu().numpy() / np.log(2) for layer_id, index, _ in group])
+
+            group_kl_sum = torch.Tensor(group_kl_sum.sum(axis=0)).to(self.args.device)
+
+            for layer_id, index, _ in group:
+                if self.mask[f"layers.{layer_id}.mu"].view(-1)[index] == 0:
+                    multiplier = torch.where(group_kl_sum > (self.args.kl2_budget + self.args.kl2_buffer), self.args.beta_adjust_multiplier, 1)
+                    multiplier = torch.where(group_kl_sum < (self.args.kl2_budget - self.args.kl2_buffer), 1/self.args.beta_adjust_multiplier, multiplier)
+                    self.beta_list[f"layers.{layer_id}.mu"].view(n_images, -1)[:, index] *= multiplier
+
+    def calculate_pnsr(self, X, Y):
+        Y_hat = self(X)
+        Y_hat = torch.clamp(Y_hat, 0., 1.)
+        Y_hat = torch.round(Y_hat * 255) / 255
+        return 20. * np.log10(1.) - 10. * (Y_hat - Y).detach().pow(2).mean((1,2)).log10()
+
+    def calculate_bpp(self, X, Y):
+        return torch.mean(self.kld_list().sum()) / X.shape[1] / np.log(2)
+
+
+class Encoder(nn.Module):
+    def __init__(self, args, trainer, kl_beta):
+        super().__init__()
+        self.args = args
+        self.trainer = trainer
 
     def progressive_encode(
         self,
@@ -416,15 +384,15 @@ class Encoder(nn.Module):
         Y,
         lr,
     ):
-        for group_id, group in enumerate(self.groups):
+        for group_id, group in enumerate(self.trainer.groups):
             if not group:
                 continue
             with torch.no_grad():
                 sample_index = self.encode_group(group)
             num_tune = self.args.num_tune
-            self.train(X, Y, num_tune, lr)
+            self.trainer.train(X, Y, num_tune, lr)
             if group_id % self.args.beta_adjust_interval == 0:
-                self.adjust_beta_list()
+                self.trainer.adjust_beta_list()
 
     @utils.time_tracking_decorator
     def encode_group(
@@ -432,7 +400,7 @@ class Encoder(nn.Module):
         group,
     ):
         group_len = len(group)
-        n_images = self.mask[f"layers.0.mu"].shape[0]
+        n_images = self.trainer.mask[f"layers.0.mu"].shape[0]
         mu_q_rec = torch.zeros(n_images, group_len)
         std_q_rec = torch.zeros(n_images, group_len)
         mu_p_rec = torch.zeros(group_len)
@@ -441,7 +409,7 @@ class Encoder(nn.Module):
         for i, (layer_id, index, _) in enumerate(group):
             row_size = self.trainer.prior.layers[layer_id].mu.size(1)
             row, col = index // row_size, index % row_size
-            self.mask[f"layers.{layer_id}.mu"][:, row, col] = 1
+            self.trainer.mask[f"layers.{layer_id}.mu"][:, row, col] = 1
 
             mu_q_rec[:, i] = self.trainer.params[f"layers.{layer_id}.mu"].data[:, row, col]
             std_q_rec[:, i] = self.trainer.st(self.trainer.params[f"layers.{layer_id}.log_std"].data)[:, row, col]
@@ -455,12 +423,6 @@ class Encoder(nn.Module):
             row_size = self.trainer.prior.layers[layer_id].mu.size(1)
             row, col = index // row_size, index % row_size
 
-            self.sample[f"layers.{layer_id}.mu"][:, row, col] = sample[:, i]
+            self.trainer.sample[f"layers.{layer_id}.mu"][:, row, col] = sample[:, i]
 
         return index
-
-    def calculate_pnsr(self, X, Y):
-        Y_hat = self(X)
-        Y_hat = torch.clamp(Y_hat, 0., 1.)
-        Y_hat = torch.round(Y_hat * 255) / 255
-        return 20. * np.log10(1.) - 10. * (Y_hat - Y).detach().pow(2).mean((1,2)).log10()
