@@ -1,11 +1,13 @@
-import utils
-import models
-from tqdm import tqdm
-import numpy as np
 import os
+
+import numpy as np
 import torch
 from PIL import Image
 from torchvision.transforms import ToTensor
+from tqdm import tqdm
+
+import models
+
 
 def train_encoder(args, X_testing, Y_testing, compression_model=None, trained_prior=None):
     if compression_model is None and trained_prior is None:
@@ -14,8 +16,10 @@ def train_encoder(args, X_testing, Y_testing, compression_model=None, trained_pr
         raise ValueError("Compression model and trained_prior may be incompatible, please only pass one")
     elif compression_model is None:
         compression_model = train_compression_model(args, X_testing, Y_testing, trained_prior)
+    trained_prior.gen_groups(args.kl2_budget, args.max_group_size)
+    compression_model.groups = trained_prior.groups
     encoder = models.Encoder(args, compression_model, kl_beta=args.kl_beta)
-    encoder.train(X_testing, Y_testing, args.comp_epochs, args.lr)
+    encoder.trainer.train(X_testing, Y_testing, args.comp_epochs, args.lr, kl_beta=args.kl_beta, tune_beta=True)
 
     encoder.progressive_encode(X_testing, Y_testing, args.lr)
 

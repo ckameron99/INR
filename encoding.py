@@ -1,8 +1,7 @@
 import torch
-from torch.distributions import Normal, Exponential
-from torch.quasirandom import SobolEngine
-
 from scipy.stats import norm
+from torch.distributions import Exponential, Normal
+from torch.quasirandom import SobolEngine
 
 
 def prior_samples(n_samples, n_variable, seed):

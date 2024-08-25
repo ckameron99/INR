@@ -2,3 +2,4 @@ __pycache__/
 Cifar_num4_emd32_lat16_beta2e-05/
 test.py
 cifar_quick.json
+main_w_paper_prior.py
