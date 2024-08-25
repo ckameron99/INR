@@ -38,16 +38,20 @@ class VariationalSirenLayer(nn.Module):
             self.activation_function = activation
         self.st = lambda x: F.softplus(x, beta=1, threshold=20)
 
-
     def forward(
         self,
         x,
     ):
-        latent_sample = self.mu + self.st(self.log_std) * torch.randn_like(self.log_std)
+        mu_w = self.mu[:-1]
+        mu_b = self.mu[-1]
+        std_w = self.st(self.log_std)[:-1]
+        std_b = self.st(self.log_std)[-1]
 
-        w, b = latent_sample[:-1], latent_sample[-1]
+        mu = torch.mm(x, mu_w) + mu_b
 
-        return self.activation_function(x @ w + b)
+        std = torch.sqrt(torch.mm(x.pow(2), std_w.pow(2)) + std_b.pow(2) + 1e-14)
+
+        return self.activation_function(mu + std * torch.randn_like(std))
 
     @property
     def std(self):
@@ -94,9 +98,6 @@ class ImageINR(nn.Module):
         self,
         x,
     ):
-        y = x
-        for layer in self.layers:
-            y = layer(y)
         return self.layers(x)
 
 
@@ -345,7 +346,6 @@ class Trainer(nn.Module):
                     self.st(self.params[f"layers.{i}.log_std"].clone().detach()).pow(2).mean(0)
                 ))
 
-    @utils.time_tracking_decorator
     def adjust_beta_list(
         self,
     ):
@@ -367,9 +367,6 @@ class Trainer(nn.Module):
         Y_hat = torch.clamp(Y_hat, 0., 1.)
         Y_hat = torch.round(Y_hat * 255) / 255
         return 20. * np.log10(1.) - 10. * (Y_hat - Y).detach().pow(2).mean((1,2)).log10()
-
-    def calculate_bpp(self, X, Y):
-        return torch.mean(self.kld_list().sum()) / X.shape[1] / np.log(2)
 
 
 class Encoder(nn.Module):
@@ -394,7 +391,6 @@ class Encoder(nn.Module):
             if group_id % self.args.beta_adjust_interval == 0:
                 self.trainer.adjust_beta_list()
 
-    @utils.time_tracking_decorator
     def encode_group(
         self,
         group,
