@@ -16,7 +16,8 @@ def train_encoder(args, X_testing, Y_testing, compression_model=None, trained_pr
         raise ValueError("Compression model and trained_prior may be incompatible, please only pass one")
     elif compression_model is None:
         compression_model = train_compression_model(args, X_testing, Y_testing, trained_prior)
-    trained_prior.gen_groups(args.kl2_budget, args.max_group_size)
+    if trained_prior.groups is None:
+        trained_prior.gen_groups(args.kl2_budget, args.max_group_size)
     compression_model.groups = trained_prior.groups
     encoder = models.Encoder(args, compression_model, kl_beta=args.kl_beta)
     encoder.trainer.train(X_testing, Y_testing, args.comp_epochs, args.lr, kl_beta=args.kl_beta, tune_beta=True)
@@ -33,7 +34,7 @@ def train_compression_model(args, X_testing, Y_testing, prior_model):
 
 
     compression_model.prior.load_state_dict(prior_model.prior.state_dict())
-    compression_model.train(X_testing, Y_testing, args.comp_epochs, args.lr, args.kl_beta)
+    compression_model.train(X_testing, Y_testing, 1, args.lr, args.kl_beta)
 
     return compression_model
 

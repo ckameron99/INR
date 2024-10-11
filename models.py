@@ -164,6 +164,7 @@ class Trainer(nn.Module):
         self.mse = torch.nn.MSELoss(reduction="none")
         self.base_model = [copy.deepcopy(self.prior).to("meta")]
         self.size = size
+        self.groups = None
 
     def update_best(self, tune_beta, loss, X, Y):
         if tune_beta:
